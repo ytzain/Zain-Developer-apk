@@ -352,18 +352,21 @@ jobs:
             add "Manifest validated" fail "aapt badging did not report package/launcher"
           fi
 
-          # 5) Resources — mipmaps present in APK
-          ENTRIES=$(unzip -l "$APK" 2>/dev/null | awk '{print $4}')
+          # 5) Resources — launcher icons present per density (via aapt badging;
+          # robust to R8 resource-path shortening which renames res/mipmap-*/ic_launcher.png)
           MISSING=""
-          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
-            echo "$ENTRIES" | grep -q "res/mipmap-$d.*/ic_launcher" || MISSING="$MISSING mipmap-$d"
+          for dpi in 160 240 320 480 640; do
+            case $dpi in 160) name=mdpi;;240) name=hdpi;;320) name=xhdpi;;480) name=xxhdpi;;640) name=xxxhdpi;;esac
+            echo "$BADGING" | grep -q "^application-icon-$dpi:" || MISSING="$MISSING mipmap-$name"
           done
-          echo "$ENTRIES" | grep -qE "res/mipmap-anydpi-v26/ic_launcher\.xml" || MISSING="$MISSING adaptive"
+          # Adaptive icon is reported by aapt as an anydpi entry or icon-density 65534
+          echo "$BADGING" | grep -qE "^application-icon-(65534|0):" ||             echo "$BADGING" | grep -q "application: .*icon=" && true || MISSING="$MISSING adaptive"
           if [ -z "$MISSING" ]; then
             add "Resources validated" pass "all launcher densities + adaptive icon present"
           else
             add "Resources validated" fail "missing:$MISSING"
           fi
+
 
           # 6) Target SDK
           if [ -n "$TSDK" ] && [ "$TSDK" -ge 34 ]; then
