@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Z-Hacker</string>
+    <string name="offline_title">You\'re offline</string>
+    <string name="offline_body">Check your connection and try again.</string>
+    <string name="retry">Retry</string>
+</resources>
