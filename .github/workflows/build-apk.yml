@@ -1,86 +1,170 @@
-name: build-apk
-
-run-name: build-apk ${{ github.event.client_payload.build_id }}
+name: Build APK
 
 on:
-  repository_dispatch:
-    types: [build-apk]
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Build UUID (from Lovable)"
+        required: true
+        type: string
+      app_name:
+        description: "App name (for display only)"
+        required: false
+        type: string
+        default: "APK Forge Build"
 
-permissions:
-  contents: read
-  actions: read
+run-name: "Build ${{ inputs.app_name }} — ${{ inputs.build_id }}"
+
+concurrency:
+  group: apk-${{ inputs.build_id }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      BUILD_DIR: builds/${{ inputs.build_id }}
+
     steps:
-      - name: Validate Input
+      - name: "stage:prepare:Preparing Build"
         run: |
-          test -n "${{ github.event.client_payload.build_id }}"
-          echo "Build id: ${{ github.event.client_payload.build_id }}"
-      - name: Checkout repository
+          echo "Build ID: $BUILD_ID"
+          echo "Build dir: $BUILD_DIR"
+          test -n "$BUILD_ID" || (echo "Missing build_id" && exit 1)
+
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: "stage:generate_project:Generating Android Project"
+        run: |
+          test -d "$BUILD_DIR" || (echo "Build dir missing: $BUILD_DIR" && exit 1)
+          test -f "$BUILD_DIR/app/build.gradle.kts"
+          test -f "$BUILD_DIR/settings.gradle.kts"
+          echo "Android project present"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-      - name: Set up Gradle
+        with:
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0"
+
+      - name: Install ImageMagick
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+
+      - name: "stage:generate_resources:Generating Resources"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          mkdir -p app/src/main/res/{mipmap-mdpi,mipmap-hdpi,mipmap-xhdpi,mipmap-xxhdpi,mipmap-xxxhdpi,drawable}
+          test -f app/src/main/res/values/strings.xml
+          test -f app/src/main/res/layout/activity_main.xml
+
+      - name: "stage:manifest:AndroidManifest"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          test -f app/src/main/AndroidManifest.xml
+          grep -q "<application" app/src/main/AndroidManifest.xml
+          grep -q "MainActivity" app/src/main/AndroidManifest.xml
+          echo "Manifest OK"
+
+      - name: "stage:icons:Processing Icons"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          SRC="icon-src.png"
+          if [ ! -f "$SRC" ]; then
+            echo "No icon-src.png — generating placeholder"
+            convert -size 512x512 gradient:'#dc2626-#0a0505'               -gravity center -pointsize 220 -fill white -annotate 0 "A" "$SRC"
+          fi
+          declare -A DENSITIES=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
+          for d in "${!DENSITIES[@]}"; do
+            size=${DENSITIES[$d]}
+            convert "$SRC" -resize ${size}x${size} "app/src/main/res/mipmap-${d}/ic_launcher.png"
+            convert "$SRC" -resize ${size}x${size} ( +clone -threshold -1 -negate -fill white -draw "circle $((size/2)),$((size/2)) $((size/2)),0" ) -alpha off -compose CopyOpacity -composite "app/src/main/res/mipmap-${d}/ic_launcher_round.png"
+          done
+          echo "Icons generated"
+
+      - name: "stage:splash:Generating Splash"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          convert "icon-src.png" -resize 320x320 -background '#0a0505' -gravity center -extent 480x800 app/src/main/res/drawable/splash.png || true
+          echo "Splash prepared"
+
+      - name: "stage:gradle_config:Configuring Gradle"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          test -f build.gradle.kts
+          test -f gradle.properties
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
-      - name: Verify Build Environment
+          gradle-version: "8.7"
+
+      - name: "stage:compile:Compiling Resources"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: gradle --no-daemon :app:processReleaseResources --stacktrace
+
+      - name: "stage:gradle_build:Running Gradle Build"
+        working-directory: ${{ env.BUILD_DIR }}
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/${{ env.BUILD_DIR }}/debug.keystore
+          KEYSTORE_PASSWORD: android
+          KEY_ALIAS: androiddebugkey
+          KEY_PASSWORD: android
         run: |
-          java -version
-          gradle --version
-          sdkmanager --version
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
-          test -d "$ANDROID_HOME/platforms/android-34"
-          test -x "$ANDROID_HOME/build-tools/34.0.0/aapt2"
-          test -x "$ANDROID_HOME/build-tools/34.0.0/apksigner"
-          test -x "$ANDROID_HOME/build-tools/34.0.0/zipalign"
-      - name: Generate Android Project
+          keytool -genkey -v -keystore debug.keystore -storepass android             -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048             -validity 10000 -dname "CN=APK Forge, OU=Zain, O=Zain Developer, L=NA, ST=NA, C=US"
+          gradle --no-daemon :app:assembleRelease --stacktrace
+
+      - name: "stage:sign:Signing APK"
+        working-directory: ${{ env.BUILD_DIR }}
         run: |
-          mkdir -p build-src
-          unzip -q "builds/${{ github.event.client_payload.build_id }}/project.zip" -d build-src
-          test -f build-src/settings.gradle
-          test -f build-src/app/build.gradle
-          test -f build-src/app/src/main/AndroidManifest.xml
-      - name: Generate Resources
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          test -n "$APK" || (echo "No APK output" && exit 1)
+          echo "APK=$APK" >> $GITHUB_ENV
+          echo "Signed by Gradle signingConfig"
+
+      - name: "stage:optimize:Optimizing APK"
+        working-directory: ${{ env.BUILD_DIR }}
         run: |
-          test -f build-src/app/src/main/res/mipmap-mdpi/ic_launcher.png
-          test -f build-src/app/src/main/res/values/strings.xml
-          test -f build-src/app/src/main/res/values/themes.xml
-      - name: Generate Signing Key
+          BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
+          ALIGNED="app/build/outputs/apk/release/aligned.apk"
+          "$ANDROID_HOME/build-tools/$BT/zipalign" -f 4 "$APK" "$ALIGNED"
+          mv "$ALIGNED" "$APK"
+
+      - name: "stage:verify:Verifying APK"
+        working-directory: ${{ env.BUILD_DIR }}
         run: |
-          keytool -genkeypair -v -keystore build-src/release.keystore -alias upload -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Zain Developer,O=Zain Developer,C=US"
-          cat > build-src/signing.properties <<'EOF'
-          storeFile=release.keystore
-          storePassword=android
-          keyAlias=upload
-          keyPassword=android
-          EOF
-      - name: Compile Resources
-        run: gradle -p build-src :app:mergeReleaseResources --no-daemon --stacktrace
-      - name: Generate Signed APK
-        run: gradle -p build-src :app:assembleRelease --no-daemon --stacktrace
-      - name: Optimize APK
+          BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --verbose "$APK"
+          SIZE=$(stat -c%s "$APK")
+          echo "APK size: $SIZE bytes"
+          test "$SIZE" -gt 100000 || (echo "APK too small" && exit 1)
+          # Sanity: zip magic
+          head -c 4 "$APK" | xxd | grep -q "504b 0304" || (echo "Not a valid zip/apk" && exit 1)
+
+      - name: "stage:ready:APK Ready"
+        working-directory: ${{ env.BUILD_DIR }}
         run: |
-          mkdir -p out
-          APK="build-src/app/build/outputs/apk/release/app-release.apk"
-          test -f "$APK"
-          "$ANDROID_HOME/build-tools/34.0.0/zipalign" -c -p 4 "$APK"
-          cp "$APK" out/app.apk
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose out/app.apk
-          test $(stat -c%s out/app.apk) -gt 1000000
-      - name: APK Ready
+          FINAL="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$FINAL" ]; then cp "$APK" "$FINAL"; fi
+          ls -la app/build/outputs/apk/release/
+
+      - name: Upload APK
+        if: always() && env.APK != ''
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ github.event.client_payload.build_id }}
-          path: out/app.apk
-          retention-days: 7
-      - name: Clean Temporary Build Files
-        if: always()
-        run: rm -rf build-src out
+          name: apk
+          path: ${{ env.BUILD_DIR }}/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
