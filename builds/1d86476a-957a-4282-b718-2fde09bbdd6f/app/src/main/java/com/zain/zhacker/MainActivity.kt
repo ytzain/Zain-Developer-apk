@@ -178,10 +178,12 @@ class MainActivity : AppCompatActivity() {
                 req.setMimeType(mimetype)
                 req.addRequestHeader("cookie", CookieManager.getInstance().getCookie(url) ?: "")
                 req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                req.setDestinationInExternalPublicDir(
-                    Environment.DIRECTORY_DOWNLOADS,
-                    android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype)
-                )
+                val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+                } else {
+                    req.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, fileName)
+                }
                 (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
                 Toast.makeText(this, "Download started", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {

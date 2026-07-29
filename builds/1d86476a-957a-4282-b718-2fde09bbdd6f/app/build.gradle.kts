@@ -88,6 +88,63 @@ android {
     }
 }
 
+val forbiddenReleasePermissions = setOf(
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
+    "android.permission.MANAGE_EXTERNAL_STORAGE",
+    "android.permission.READ_MEDIA_AUDIO",
+    "android.permission.READ_MEDIA_IMAGES",
+    "android.permission.READ_MEDIA_VIDEO",
+    "android.permission.ACCESS_MEDIA_LOCATION"
+)
+
+fun sanitizeManifestFile(manifest: java.io.File): Int {
+    if (!manifest.isFile) return 0
+    var text = manifest.readText()
+    var removed = 0
+    for (permission in forbiddenReleasePermissions) {
+        val quoted = Regex.escape(permission)
+        val before = text
+        text = text.replace(
+            Regex("""(?s)s*<uses-permission(?:-[A-Za-z0-9_-]+)?(?=[^>]*android:name=["']$quoted["'])[^>]*/>"""),
+            ""
+        )
+        text = text.replace(
+            Regex("""(?s)s*<uses-permission(?:-[A-Za-z0-9_-]+)?(?=[^>]*android:name=["']$quoted["'])[^>]*>.*?</uses-permission(?:-[A-Za-z0-9_-]+)?>"""),
+            ""
+        )
+        if (text != before) removed++
+    }
+    if (removed > 0) manifest.writeText(text)
+    return removed
+}
+
+val sanitizeReleaseManifestPermissions = tasks.register("sanitizeReleaseManifestPermissions") {
+    doLast {
+        val intermediates = layout.buildDirectory.dir("intermediates").get().asFile
+        val manifests = fileTree(intermediates) { include("**/AndroidManifest.xml") }.files
+        val changed = manifests.sumOf { sanitizeManifestFile(it) }
+        if (changed > 0) {
+            println("Removed forbidden storage/media permissions from merged release manifest files.")
+        }
+    }
+}
+
+tasks.matching {
+    it.name == "processReleaseMainManifest" ||
+        it.name == "processReleaseManifest" ||
+        it.name == "processReleaseManifestForPackage"
+}.configureEach {
+    val manifestTask = this
+    sanitizeReleaseManifestPermissions.configure { mustRunAfter(manifestTask) }
+}
+
+tasks.matching {
+    it.name == "processReleaseResources" || it.name == "packageRelease" || it.name == "assembleRelease"
+}.configureEach {
+    dependsOn(sanitizeReleaseManifestPermissions)
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
