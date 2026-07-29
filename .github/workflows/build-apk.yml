@@ -375,13 +375,18 @@ jobs:
             add "Target SDK verified" fail "targetSdk=$TSDK is below current Play requirement"
           fi
 
-          # 7) Dependencies — safe permission set for a WebView-only app
+          # 7) Dependencies — exact safe permission set for a WebView-only app.
+          # Any extra APK permission means a dependency or manifest-merger rule leaked
+          # into the final package, so fail before release.
           BAD=""
-          for perm in READ_CONTACTS READ_SMS SEND_SMS RECORD_AUDIO READ_PHONE_STATE ACCESS_FINE_LOCATION ACCESS_BACKGROUND_LOCATION READ_CALL_LOG READ_EXTERNAL_STORAGE; do
-            if echo "$PERMS" | grep -q "android.permission.$perm"; then BAD="$BAD $perm"; fi
+          for perm in $(echo "$PERMS" | tr ',' ' '); do
+            case "$perm" in
+              ""|android.permission.INTERNET|android.permission.ACCESS_NETWORK_STATE) ;;
+              *) BAD="$BAD ${perm#android.permission.}" ;;
+            esac
           done
           if [ -z "$BAD" ]; then
-            add "Dependencies verified" pass "permissions=[$PERMS]"
+            add "Dependencies verified" pass "only INTERNET + ACCESS_NETWORK_STATE"
           else
             add "Dependencies verified" fail "dangerous permissions present:$BAD"
           fi
