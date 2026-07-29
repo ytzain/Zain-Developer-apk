@@ -22,7 +22,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: read
@@ -30,6 +30,7 @@ jobs:
     env:
       BUILD_ID: ${{ inputs.build_id }}
       BUILD_DIR: builds/${{ inputs.build_id }}
+      APP_NAME: ${{ inputs.app_name }}
 
     steps:
       - name: "stage:prepare:Preparing Build"
@@ -59,13 +60,24 @@ jobs:
         with:
           packages: "platform-tools platforms;android-34 build-tools;34.0.0"
 
-      - name: Install ImageMagick
-        run: sudo apt-get update && sudo apt-get install -y imagemagick
+      - name: "Preflight: image tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick python3-pil fonts-dejavu-core
+          command -v convert >/dev/null || (echo "ImageMagick missing" && exit 1)
+          python3 -c "from PIL import Image, ImageDraw, ImageFont; print('Pillow', Image.__version__)"
 
       - name: "stage:generate_resources:Generating Resources"
         working-directory: ${{ env.BUILD_DIR }}
         run: |
-          mkdir -p app/src/main/res/{mipmap-mdpi,mipmap-hdpi,mipmap-xhdpi,mipmap-xxhdpi,mipmap-xxxhdpi,drawable}
+          mkdir -p app/src/main/res/mipmap-mdpi
+          mkdir -p app/src/main/res/mipmap-hdpi
+          mkdir -p app/src/main/res/mipmap-xhdpi
+          mkdir -p app/src/main/res/mipmap-xxhdpi
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/values
           test -f app/src/main/res/values/strings.xml
           test -f app/src/main/res/layout/activity_main.xml
 
@@ -79,25 +91,250 @@ jobs:
 
       - name: "stage:icons:Processing Icons"
         working-directory: ${{ env.BUILD_DIR }}
+        env:
+          APP_NAME_ENV: ${{ inputs.app_name }}
+        shell: bash
         run: |
-          SRC="icon-src.png"
-          if [ ! -f "$SRC" ]; then
-            echo "No icon-src.png — generating placeholder"
-            convert -size 512x512 gradient:'#dc2626-#0a0505'               -gravity center -pointsize 220 -fill white -annotate 0 "A" "$SRC"
-          fi
-          declare -A DENSITIES=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
-          for d in "${!DENSITIES[@]}"; do
-            size=${DENSITIES[$d]}
-            convert "$SRC" -resize ${size}x${size} "app/src/main/res/mipmap-${d}/ic_launcher.png"
-            convert "$SRC" -resize ${size}x${size} ( +clone -threshold -1 -negate -fill white -draw "circle $((size/2)),$((size/2)) $((size/2)),0" ) -alpha off -compose CopyOpacity -composite "app/src/main/res/mipmap-${d}/ic_launcher_round.png"
-          done
-          echo "Icons generated"
+          set -uo pipefail
+          echo "::group::Environment"
+          python3 --version || true
+          python3 -c "import PIL, sys; print('Pillow', PIL.__version__)" || true
+          command -v convert && convert -version | head -n1 || echo "ImageMagick not on PATH"
+          ls -la . || true
+          ls -la app/src/main/res || true
+          echo "::endgroup::"
 
+          mkdir -p /tmp/apkforge
+          cat > /tmp/apkforge/process_icons.py <<'PYEOF'
+          import os, sys, glob, traceback
+          from PIL import Image, ImageDraw, ImageFont
+
+          # Pillow >=10 removed Image.LANCZOS in favor of Image.Resampling.LANCZOS
+          try:
+              LANCZOS = Image.Resampling.LANCZOS
+          except AttributeError:
+              LANCZOS = Image.LANCZOS  # type: ignore
+
+          BUILD_DIR = os.getcwd()
+          RES = os.path.join(BUILD_DIR, "app/src/main/res")
+          DENSITIES = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+          def log(msg): print(msg, flush=True)
+
+          def find_source():
+              for p in sorted(glob.glob(os.path.join(BUILD_DIR, "icon-src.*"))):
+                  ext = p.rsplit(".", 1)[-1].lower()
+                  if ext in ("png", "jpg", "jpeg", "webp", "bmp"):
+                      return p
+              return None
+
+          def load_font(size):
+              candidates = [
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                  "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                  "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+              ]
+              for path in candidates:
+                  if os.path.exists(path):
+                      try: return ImageFont.truetype(path, size)
+                      except Exception: pass
+              return ImageFont.load_default()
+
+          def make_placeholder():
+              log("Generating premium placeholder icon (Cyber Red).")
+              size = 512
+              img = Image.new("RGBA", (size, size), (10, 5, 5, 255))
+              d = ImageDraw.Draw(img)
+              cx, cy = size // 2, size // 2
+              d.ellipse((cx - 180, cy - 180, cx + 180, cy + 180), fill=(220, 38, 38, 255))
+              font = load_font(260)
+              name = os.environ.get("APP_NAME_ENV") or os.environ.get("APP_NAME") or "A"
+              letter = ("".join(c for c in name if c.isalnum())[:1] or "A").upper()
+              try:
+                  bbox = d.textbbox((0, 0), letter, font=font)
+                  w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                  d.text(((size - w) / 2 - bbox[0], (size - h) / 2 - bbox[1]), letter, fill="white", font=font)
+              except Exception as e:
+                  log(f"::warning::text render failed ({e}); using solid circle placeholder")
+              return img
+
+          def normalize(path):
+              sz = os.path.getsize(path)
+              if sz < 100: raise ValueError(f"file too small ({sz}B)")
+              if sz > 20 * 1024 * 1024: raise ValueError(f"file too large ({sz}B)")
+              img = Image.open(path)
+              img.load()
+              if img.mode != "RGBA": img = img.convert("RGBA")
+              w, h = img.size
+              if w < 32 or h < 32: raise ValueError(f"dimensions too small: {w}x{h}")
+              if max(w, h) > 4096: img.thumbnail((4096, 4096), LANCZOS)
+              side = min(img.size)
+              left = (img.width - side) // 2
+              top = (img.height - side) // 2
+              img = img.crop((left, top, left + side, top + side)).resize((512, 512), LANCZOS)
+              return img, sz
+
+          def try_repair(path):
+              out = "/tmp/icon-repair.png"
+              try: os.remove(out)
+              except FileNotFoundError: pass
+              cmd = f'convert "{path}" -colorspace sRGB -alpha on -background none -flatten -resize 512x512 "{out}"'
+              log(f"Repairing via ImageMagick: {cmd}")
+              rc = os.system(cmd + " 2>&1")
+              if rc != 0 or not os.path.exists(out):
+                  raise RuntimeError(f"ImageMagick repair failed (rc={rc})")
+              return normalize(out)
+
+          def rounded(img, size):
+              im = img.resize((size, size), LANCZOS).convert("RGBA")
+              mask = Image.new("L", (size, size), 0)
+              ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+              out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              out.paste(im, (0, 0), mask)
+              return out
+
+          def foreground(img, size):
+              canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              inner = int(size * 0.66)
+              scaled = img.resize((inner, inner), LANCZOS)
+              off = (size - inner) // 2
+              canvas.paste(scaled, (off, off), scaled)
+              return canvas
+
+          def acquire_base():
+              src = find_source()
+              if not src:
+                  log("No icon uploaded — using premium placeholder.")
+                  return make_placeholder(), "placeholder", ""
+              log(f"::group::Icon source: {os.path.basename(src)}")
+              try:
+                  img, sz = normalize(src)
+                  log(f"OK: validated {os.path.basename(src)} ({sz}B) -> 512x512 RGBA")
+                  log("::endgroup::")
+                  return img, "user", ""
+              except Exception as e:
+                  log(f"::warning::primary validation failed: {e}")
+              try:
+                  img, sz = try_repair(src)
+                  log(f"OK: repaired via ImageMagick ({sz}B original)")
+                  log("::endgroup::")
+                  return img, "user-repaired", f" (auto-repaired: {e})"
+              except Exception as e2:
+                  log(f"::warning::repair failed: {e2}")
+                  log("Falling back to premium placeholder.")
+                  log("::endgroup::")
+                  return make_placeholder(), "placeholder", " (upload unusable; premium placeholder used)"
+
+          def main():
+              os.makedirs(RES, exist_ok=True)
+              try:
+                  base, kind, note = acquire_base()
+              except Exception as e:
+                  log(f"::warning::acquire_base crashed ({e}); using placeholder")
+                  traceback.print_exc()
+                  base, kind, note = make_placeholder(), "placeholder", " (acquire crashed; placeholder used)"
+
+              try: base.save("/tmp/icon-final.png", "PNG")
+              except Exception as e: log(f"::warning::cache save failed: {e}")
+
+              generated = 0
+              for d, size in DENSITIES.items():
+                  folder = os.path.join(RES, f"mipmap-{d}")
+                  os.makedirs(folder, exist_ok=True)
+                  try:
+                      base.resize((size, size), LANCZOS).save(os.path.join(folder, "ic_launcher.png"), "PNG"); generated += 1
+                      rounded(base, size).save(os.path.join(folder, "ic_launcher_round.png"), "PNG"); generated += 1
+                      foreground(base, size).save(os.path.join(folder, "ic_launcher_foreground.png"), "PNG"); generated += 1
+                  except Exception as e:
+                      log(f"::warning::failed to write mipmap-{d}: {e}")
+
+              try:
+                  os.makedirs(os.path.join(RES, "values"), exist_ok=True)
+                  with open(os.path.join(RES, "values", "ic_launcher_background.xml"), "w") as f:
+                      f.write('<?xml version="1.0" encoding="utf-8"?>\n<resources><color name="ic_launcher_background">#0A0505</color></resources>\n')
+                  adaptive = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                              '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                              '  <background android:drawable="@color/ic_launcher_background"/>\n'
+                              '  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                              '</adaptive-icon>\n')
+                  anydpi = os.path.join(RES, "mipmap-anydpi-v26")
+                  os.makedirs(anydpi, exist_ok=True)
+                  with open(os.path.join(anydpi, "ic_launcher.xml"), "w") as f: f.write(adaptive)
+                  with open(os.path.join(anydpi, "ic_launcher_round.xml"), "w") as f: f.write(adaptive)
+              except Exception as e:
+                  log(f"::warning::adaptive XML write failed: {e}")
+
+              missing = []
+              for d in DENSITIES:
+                  for name in ("ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"):
+                      p = os.path.join(RES, f"mipmap-{d}", name)
+                      if not os.path.exists(p) or os.path.getsize(p) < 100:
+                          missing.append(p)
+
+              if missing:
+                  log("::warning::some outputs missing; regenerating from placeholder")
+                  ph = make_placeholder()
+                  for d, size in DENSITIES.items():
+                      folder = os.path.join(RES, f"mipmap-{d}")
+                      os.makedirs(folder, exist_ok=True)
+                      ph.resize((size, size), LANCZOS).save(os.path.join(folder, "ic_launcher.png"), "PNG")
+                      rounded(ph, size).save(os.path.join(folder, "ic_launcher_round.png"), "PNG")
+                      foreground(ph, size).save(os.path.join(folder, "ic_launcher_foreground.png"), "PNG")
+
+              # Final verification pass
+              final_missing = []
+              for d in DENSITIES:
+                  for name in ("ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"):
+                      p = os.path.join(RES, f"mipmap-{d}", name)
+                      if not os.path.exists(p) or os.path.getsize(p) < 100:
+                          final_missing.append(p)
+              if final_missing:
+                  # Extremely unlikely: filesystem write issue. Fail loudly but with a clear message.
+                  log("::error::Failed to produce required launcher icons:")
+                  for p in final_missing: log(f"  - {p}")
+                  return 1
+
+              log(f"OK: {generated} PNGs + adaptive XML written. Source: {kind}{note}")
+              return 0
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except Exception as e:
+                  print(f"::error::icons pipeline crashed: {e}", flush=True)
+                  traceback.print_exc()
+                  # Last-chance placeholder so the build doesn't die on icons
+                  try:
+                      from PIL import Image as _I, ImageDraw as _D
+                      base = _I.new("RGBA", (512, 512), (10, 5, 5, 255))
+                      _D.Draw(base).ellipse((76, 76, 436, 436), fill=(220, 38, 38, 255))
+                      for d, size in {"mdpi":48,"hdpi":72,"xhdpi":96,"xxhdpi":144,"xxxhdpi":192}.items():
+                          folder = os.path.join(RES, f"mipmap-{d}")
+                          os.makedirs(folder, exist_ok=True)
+                          r = base.resize((size, size), LANCZOS)
+                          r.save(os.path.join(folder, "ic_launcher.png"), "PNG")
+                          r.save(os.path.join(folder, "ic_launcher_round.png"), "PNG")
+                          r.save(os.path.join(folder, "ic_launcher_foreground.png"), "PNG")
+                      print("OK: recovered with emergency placeholder", flush=True)
+                      sys.exit(0)
+                  except Exception as e2:
+                      print(f"::error::emergency placeholder failed: {e2}", flush=True)
+                      sys.exit(1)
+          PYEOF
+
+          python3 /tmp/apkforge/process_icons.py
+          RC=$?
+          echo "icons stage exit code: $RC"
+          exit $RC
       - name: "stage:splash:Generating Splash"
         working-directory: ${{ env.BUILD_DIR }}
         run: |
-          convert "icon-src.png" -resize 320x320 -background '#0a0505' -gravity center -extent 480x800 app/src/main/res/drawable/splash.png || true
-          echo "Splash prepared"
+          set -e
+          SRC="/tmp/icon-final.png"
+          if [ ! -f "$SRC" ]; then SRC="app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"; fi
+          convert "$SRC" -resize 320x320 -background '#0A0505' -gravity center -extent 480x800 app/src/main/res/drawable/splash.png
+          test -f app/src/main/res/drawable/splash.png
+          echo "Splash generated"
 
       - name: "stage:gradle_config:Configuring Gradle"
         working-directory: ${{ env.BUILD_DIR }}
@@ -123,7 +360,9 @@ jobs:
           KEY_ALIAS: androiddebugkey
           KEY_PASSWORD: android
         run: |
-          keytool -genkey -v -keystore debug.keystore -storepass android             -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048             -validity 10000 -dname "CN=APK Forge, OU=Zain, O=Zain Developer, L=NA, ST=NA, C=US"
+          keytool -genkey -v -keystore debug.keystore -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=APK Forge, OU=Zain, O=Zain Developer, L=NA, ST=NA, C=US"
           gradle --no-daemon :app:assembleRelease --stacktrace
 
       - name: "stage:sign:Signing APK"
@@ -150,7 +389,6 @@ jobs:
           SIZE=$(stat -c%s "$APK")
           echo "APK size: $SIZE bytes"
           test "$SIZE" -gt 100000 || (echo "APK too small" && exit 1)
-          # Sanity: zip magic
           head -c 4 "$APK" | xxd | grep -q "504b 0304" || (echo "Not a valid zip/apk" && exit 1)
 
       - name: "stage:ready:APK Ready"
