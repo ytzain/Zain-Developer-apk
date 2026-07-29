@@ -368,24 +368,35 @@ jobs:
       - name: "stage:sign:Signing APK"
         working-directory: ${{ env.BUILD_DIR }}
         run: |
-          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          APK=$(ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -n1)
           test -n "$APK" || (echo "No APK output" && exit 1)
+          echo "Found APK: $APK"
           echo "APK=$APK" >> $GITHUB_ENV
-          echo "Signed by Gradle signingConfig"
 
       - name: "stage:optimize:Optimizing APK"
         working-directory: ${{ env.BUILD_DIR }}
         run: |
           BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
           ALIGNED="app/build/outputs/apk/release/aligned.apk"
-          "$ANDROID_HOME/build-tools/$BT/zipalign" -f 4 "$APK" "$ALIGNED"
+          "$ANDROID_HOME/build-tools/$BT/zipalign" -p -f 4 "$APK" "$ALIGNED"
           mv "$ALIGNED" "$APK"
+          echo "Zipaligned: $APK"
+          "$ANDROID_HOME/build-tools/$BT/apksigner" sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            "$APK"
+          echo "Signed with apksigner (v1+v2+v3)"
 
       - name: "stage:verify:Verifying APK"
         working-directory: ${{ env.BUILD_DIR }}
         run: |
           BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
-          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --verbose "$APK"
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --verbose --print-certs "$APK"
           SIZE=$(stat -c%s "$APK")
           echo "APK size: $SIZE bytes"
           test "$SIZE" -gt 100000 || (echo "APK too small" && exit 1)
