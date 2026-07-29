@@ -1,1 +1,0 @@
-APK builder repository contents permission check. This file is deleted automatically.
