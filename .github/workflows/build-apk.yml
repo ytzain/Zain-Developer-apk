@@ -8,11 +8,16 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate Input
+        run: |
+          test -n "${{ github.event.client_payload.build_id }}"
+          echo "Build id: ${{ github.event.client_payload.build_id }}"
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Set up JDK 17
@@ -26,21 +31,56 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
-      - name: Unpack generated project
+      - name: Verify Build Environment
+        run: |
+          java -version
+          gradle --version
+          sdkmanager --version
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          test -d "$ANDROID_HOME/platforms/android-34"
+          test -x "$ANDROID_HOME/build-tools/34.0.0/aapt2"
+          test -x "$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          test -x "$ANDROID_HOME/build-tools/34.0.0/zipalign"
+      - name: Generate Android Project
         run: |
           mkdir -p build-src
           unzip -q "builds/${{ github.event.client_payload.build_id }}/project.zip" -d build-src
-          ls -R build-src | head -50
-      - name: Build APK
-        run: gradle -p build-src assembleDebug --no-daemon --stacktrace
-      - name: Collect APK
+          test -f build-src/settings.gradle
+          test -f build-src/app/build.gradle
+          test -f build-src/app/src/main/AndroidManifest.xml
+      - name: Generate Resources
+        run: |
+          test -f build-src/app/src/main/res/mipmap-mdpi/ic_launcher.png
+          test -f build-src/app/src/main/res/values/strings.xml
+          test -f build-src/app/src/main/res/values/themes.xml
+      - name: Generate Signing Key
+        run: |
+          keytool -genkeypair -v -keystore build-src/release.keystore -alias upload -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Zain Developer,O=Zain Developer,C=US"
+          cat > build-src/signing.properties <<'EOF'
+          storeFile=release.keystore
+          storePassword=android
+          keyAlias=upload
+          keyPassword=android
+          EOF
+      - name: Compile Resources
+        run: gradle -p build-src :app:mergeReleaseResources --no-daemon --stacktrace
+      - name: Generate Signed APK
+        run: gradle -p build-src :app:assembleRelease --no-daemon --stacktrace
+      - name: Optimize APK
         run: |
           mkdir -p out
-          find build-src -name "*.apk" -exec cp {} out/app.apk \;
-          ls -la out
-      - name: Upload APK
+          APK="build-src/app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK"
+          "$ANDROID_HOME/build-tools/34.0.0/zipalign" -c -p 4 "$APK"
+          cp "$APK" out/app.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose out/app.apk
+          test $(stat -c%s out/app.apk) -gt 1000000
+      - name: APK Ready
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ github.event.client_payload.build_id }}
           path: out/app.apk
           retention-days: 7
+      - name: Clean Temporary Build Files
+        if: always()
+        run: rm -rf build-src out
