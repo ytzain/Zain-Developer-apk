@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.App" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/appPrimary</item>
+        <item name="colorPrimaryVariant">@color/appPrimary</item>
+        <item name="android:statusBarColor">@color/appBackground</item>
+        <item name="android:navigationBarColor">@color/appBackground</item>
+        <item name="android:windowBackground">@color/appBackground</item>
+        <item name="android:windowFullscreen">false</item>
+    </style>
+    <style name="Theme.App.Splash" parent="Theme.App">
+        <item name="android:windowBackground">@drawable/splash_background</item>
+        <item name="android:windowFullscreen">false</item>
+    </style>
+</resources>
