@@ -51,6 +51,8 @@ jobs:
             -d '{"build_id":"${{ inputs.build_id }}","stage":"dependencies","status":"success","message":"JDK 17 + Android SDK ready"}' || true
 
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -97,6 +99,9 @@ jobs:
         run: |
           set -o pipefail
           cd project
+          curl -sS -X POST "${{ inputs.callback_url }}/status" \
+            -H "content-type: application/json" -H "x-build-token: ${{ inputs.callback_token }}" \
+            -d '{"build_id":"${{ inputs.build_id }}","stage":"assemble","status":"running","message":"Compiling Android application"}' || true
           gradle --no-daemon assembleRelease 2>&1 | tail -n 400
 
       - name: Sign and verify APK
