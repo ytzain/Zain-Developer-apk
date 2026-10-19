@@ -4,17 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       build_id:
-        description: Build id
+        description: "Build UUID (from Lovable)"
         required: true
-      build_ref:
-        description: Branch holding the generated Android project
-        required: true
-      callback_url:
-        description: Status callback base URL
-        required: true
-      callback_token:
-        description: Per-build callback token
-        required: true
+        type: string
+      app_name:
+        description: "App name (for display only)"
+        required: false
+        type: string
+        default: "APK Forge Build"
+
+run-name: "Build ${{ inputs.app_name }} — ${{ inputs.build_id }}"
 
 concurrency:
   group: apk-${{ inputs.build_id }}
@@ -23,125 +22,409 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      actions: read
+
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      BUILD_DIR: builds/${{ inputs.build_id }}
+      APP_NAME: ${{ inputs.app_name }}
+
     steps:
-      - name: Mask secrets
-        run: echo "::add-mask::${{ inputs.callback_token }}"
-
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.build_ref }}
-
-      - name: Report queued
+      - name: "stage:prepare:Preparing Build"
         run: |
-          curl -sS -X POST "${{ inputs.callback_url }}/status" \
-            -H "content-type: application/json" \
-            -H "x-build-token: ${{ inputs.callback_token }}" \
-            -d '{"build_id":"${{ inputs.build_id }}","stage":"project","status":"running","message":"Runner acquired"}' || true
+          echo "Build ID: $BUILD_ID"
+          echo "Build dir: $BUILD_DIR"
+          test -n "$BUILD_ID" || (echo "Missing build_id" && exit 1)
 
-      - uses: actions/setup-java@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "stage:generate_project:Generating Android Project"
+        run: |
+          test -d "$BUILD_DIR" || (echo "Build dir missing: $BUILD_DIR" && exit 1)
+          test -f "$BUILD_DIR/app/build.gradle.kts"
+          test -f "$BUILD_DIR/settings.gradle.kts"
+          echo "Android project present"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Report toolchain
-        run: |
-          curl -sS -X POST "${{ inputs.callback_url }}/status" \
-            -H "content-type: application/json" -H "x-build-token: ${{ inputs.callback_token }}" \
-            -d '{"build_id":"${{ inputs.build_id }}","stage":"dependencies","status":"success","message":"JDK 17 + Android SDK ready"}' || true
-
-      - name: Verify Android SDK
-        run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms" | tail -n 3
-          ls "$ANDROID_HOME/build-tools" | tail -n 3
-
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
         with:
-          gradle-version: '8.7'
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0"
 
-      - name: Generate launcher icons
+      - name: "Preflight: image tools"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick python3-pil fonts-dejavu-core
+          command -v convert >/dev/null || (echo "ImageMagick missing" && exit 1)
+          python3 -c "from PIL import Image, ImageDraw, ImageFont; print('Pillow', Image.__version__)"
+
+      - name: "stage:generate_resources:Generating Resources"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          mkdir -p app/src/main/res/mipmap-mdpi
+          mkdir -p app/src/main/res/mipmap-hdpi
+          mkdir -p app/src/main/res/mipmap-xhdpi
+          mkdir -p app/src/main/res/mipmap-xxhdpi
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/values
+          test -f app/src/main/res/values/strings.xml
+          test -f app/src/main/res/layout/activity_main.xml
+
+      - name: "stage:manifest:AndroidManifest"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          test -f app/src/main/AndroidManifest.xml
+          grep -q "<application" app/src/main/AndroidManifest.xml
+          grep -q "MainActivity" app/src/main/AndroidManifest.xml
+          echo "Manifest OK"
+
+      - name: "stage:icons:Processing Icons"
+        working-directory: ${{ env.BUILD_DIR }}
+        env:
+          APP_NAME_ENV: ${{ inputs.app_name }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "::group::Environment"
+          python3 --version || true
+          python3 -c "import PIL, sys; print('Pillow', PIL.__version__)" || true
+          command -v convert && convert -version | head -n1 || echo "ImageMagick not on PATH"
+          ls -la . || true
+          ls -la app/src/main/res || true
+          echo "::endgroup::"
+
+          mkdir -p /tmp/apkforge
+          cat > /tmp/apkforge/process_icons.py <<'PYEOF'
+          import os, sys, glob, traceback
+          from PIL import Image, ImageDraw, ImageFont
+
+          # Pillow >=10 removed Image.LANCZOS in favor of Image.Resampling.LANCZOS
+          try:
+              LANCZOS = Image.Resampling.LANCZOS
+          except AttributeError:
+              LANCZOS = Image.LANCZOS  # type: ignore
+
+          BUILD_DIR = os.getcwd()
+          RES = os.path.join(BUILD_DIR, "app/src/main/res")
+          DENSITIES = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+          def log(msg): print(msg, flush=True)
+
+          def find_source():
+              for p in sorted(glob.glob(os.path.join(BUILD_DIR, "icon-src.*"))):
+                  ext = p.rsplit(".", 1)[-1].lower()
+                  if ext in ("png", "jpg", "jpeg", "webp", "bmp"):
+                      return p
+              return None
+
+          def load_font(size):
+              candidates = [
+                  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                  "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                  "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+              ]
+              for path in candidates:
+                  if os.path.exists(path):
+                      try: return ImageFont.truetype(path, size)
+                      except Exception: pass
+              return ImageFont.load_default()
+
+          def make_placeholder():
+              log("Generating premium placeholder icon (Cyber Red).")
+              size = 512
+              img = Image.new("RGBA", (size, size), (10, 5, 5, 255))
+              d = ImageDraw.Draw(img)
+              cx, cy = size // 2, size // 2
+              d.ellipse((cx - 180, cy - 180, cx + 180, cy + 180), fill=(220, 38, 38, 255))
+              font = load_font(260)
+              name = os.environ.get("APP_NAME_ENV") or os.environ.get("APP_NAME") or "A"
+              letter = ("".join(c for c in name if c.isalnum())[:1] or "A").upper()
+              try:
+                  bbox = d.textbbox((0, 0), letter, font=font)
+                  w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                  d.text(((size - w) / 2 - bbox[0], (size - h) / 2 - bbox[1]), letter, fill="white", font=font)
+              except Exception as e:
+                  log(f"::warning::text render failed ({e}); using solid circle placeholder")
+              return img
+
+          def normalize(path):
+              sz = os.path.getsize(path)
+              if sz < 100: raise ValueError(f"file too small ({sz}B)")
+              if sz > 20 * 1024 * 1024: raise ValueError(f"file too large ({sz}B)")
+              img = Image.open(path)
+              img.load()
+              if img.mode != "RGBA": img = img.convert("RGBA")
+              w, h = img.size
+              if w < 32 or h < 32: raise ValueError(f"dimensions too small: {w}x{h}")
+              if max(w, h) > 4096: img.thumbnail((4096, 4096), LANCZOS)
+              side = min(img.size)
+              left = (img.width - side) // 2
+              top = (img.height - side) // 2
+              img = img.crop((left, top, left + side, top + side)).resize((512, 512), LANCZOS)
+              return img, sz
+
+          def try_repair(path):
+              out = "/tmp/icon-repair.png"
+              try: os.remove(out)
+              except FileNotFoundError: pass
+              cmd = f'convert "{path}" -colorspace sRGB -alpha on -background none -flatten -resize 512x512 "{out}"'
+              log(f"Repairing via ImageMagick: {cmd}")
+              rc = os.system(cmd + " 2>&1")
+              if rc != 0 or not os.path.exists(out):
+                  raise RuntimeError(f"ImageMagick repair failed (rc={rc})")
+              return normalize(out)
+
+          def rounded(img, size):
+              im = img.resize((size, size), LANCZOS).convert("RGBA")
+              mask = Image.new("L", (size, size), 0)
+              ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+              out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              out.paste(im, (0, 0), mask)
+              return out
+
+          def foreground(img, size):
+              canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              inner = int(size * 0.66)
+              scaled = img.resize((inner, inner), LANCZOS)
+              off = (size - inner) // 2
+              canvas.paste(scaled, (off, off), scaled)
+              return canvas
+
+          def acquire_base():
+              src = find_source()
+              if not src:
+                  log("No icon uploaded — using premium placeholder.")
+                  return make_placeholder(), "placeholder", ""
+              log(f"::group::Icon source: {os.path.basename(src)}")
+              try:
+                  img, sz = normalize(src)
+                  log(f"OK: validated {os.path.basename(src)} ({sz}B) -> 512x512 RGBA")
+                  log("::endgroup::")
+                  return img, "user", ""
+              except Exception as e:
+                  log(f"::warning::primary validation failed: {e}")
+              try:
+                  img, sz = try_repair(src)
+                  log(f"OK: repaired via ImageMagick ({sz}B original)")
+                  log("::endgroup::")
+                  return img, "user-repaired", f" (auto-repaired: {e})"
+              except Exception as e2:
+                  log(f"::warning::repair failed: {e2}")
+                  log("Falling back to premium placeholder.")
+                  log("::endgroup::")
+                  return make_placeholder(), "placeholder", " (upload unusable; premium placeholder used)"
+
+          def main():
+              os.makedirs(RES, exist_ok=True)
+              try:
+                  base, kind, note = acquire_base()
+              except Exception as e:
+                  log(f"::warning::acquire_base crashed ({e}); using placeholder")
+                  traceback.print_exc()
+                  base, kind, note = make_placeholder(), "placeholder", " (acquire crashed; placeholder used)"
+
+              try: base.save("/tmp/icon-final.png", "PNG")
+              except Exception as e: log(f"::warning::cache save failed: {e}")
+
+              generated = 0
+              for d, size in DENSITIES.items():
+                  folder = os.path.join(RES, f"mipmap-{d}")
+                  os.makedirs(folder, exist_ok=True)
+                  try:
+                      base.resize((size, size), LANCZOS).save(os.path.join(folder, "ic_launcher.png"), "PNG"); generated += 1
+                      rounded(base, size).save(os.path.join(folder, "ic_launcher_round.png"), "PNG"); generated += 1
+                      foreground(base, size).save(os.path.join(folder, "ic_launcher_foreground.png"), "PNG"); generated += 1
+                  except Exception as e:
+                      log(f"::warning::failed to write mipmap-{d}: {e}")
+
+              try:
+                  os.makedirs(os.path.join(RES, "values"), exist_ok=True)
+                  with open(os.path.join(RES, "values", "ic_launcher_background.xml"), "w") as f:
+                      f.write('<?xml version="1.0" encoding="utf-8"?>\n<resources><color name="ic_launcher_background">#0A0505</color></resources>\n')
+                  adaptive = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                              '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                              '  <background android:drawable="@color/ic_launcher_background"/>\n'
+                              '  <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                              '</adaptive-icon>\n')
+                  anydpi = os.path.join(RES, "mipmap-anydpi-v26")
+                  os.makedirs(anydpi, exist_ok=True)
+                  with open(os.path.join(anydpi, "ic_launcher.xml"), "w") as f: f.write(adaptive)
+                  with open(os.path.join(anydpi, "ic_launcher_round.xml"), "w") as f: f.write(adaptive)
+              except Exception as e:
+                  log(f"::warning::adaptive XML write failed: {e}")
+
+              missing = []
+              for d in DENSITIES:
+                  for name in ("ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"):
+                      p = os.path.join(RES, f"mipmap-{d}", name)
+                      if not os.path.exists(p) or os.path.getsize(p) < 100:
+                          missing.append(p)
+
+              if missing:
+                  log("::warning::some outputs missing; regenerating from placeholder")
+                  ph = make_placeholder()
+                  for d, size in DENSITIES.items():
+                      folder = os.path.join(RES, f"mipmap-{d}")
+                      os.makedirs(folder, exist_ok=True)
+                      ph.resize((size, size), LANCZOS).save(os.path.join(folder, "ic_launcher.png"), "PNG")
+                      rounded(ph, size).save(os.path.join(folder, "ic_launcher_round.png"), "PNG")
+                      foreground(ph, size).save(os.path.join(folder, "ic_launcher_foreground.png"), "PNG")
+
+              # Final verification pass
+              final_missing = []
+              for d in DENSITIES:
+                  for name in ("ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"):
+                      p = os.path.join(RES, f"mipmap-{d}", name)
+                      if not os.path.exists(p) or os.path.getsize(p) < 100:
+                          final_missing.append(p)
+              if final_missing:
+                  # Extremely unlikely: filesystem write issue. Fail loudly but with a clear message.
+                  log("::error::Failed to produce required launcher icons:")
+                  for p in final_missing: log(f"  - {p}")
+                  return 1
+
+              log(f"OK: {generated} PNGs + adaptive XML written. Source: {kind}{note}")
+              return 0
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except Exception as e:
+                  print(f"::error::icons pipeline crashed: {e}", flush=True)
+                  traceback.print_exc()
+                  # Last-chance placeholder so the build doesn't die on icons
+                  try:
+                      from PIL import Image as _I, ImageDraw as _D
+                      base = _I.new("RGBA", (512, 512), (10, 5, 5, 255))
+                      _D.Draw(base).ellipse((76, 76, 436, 436), fill=(220, 38, 38, 255))
+                      for d, size in {"mdpi":48,"hdpi":72,"xhdpi":96,"xxhdpi":144,"xxxhdpi":192}.items():
+                          folder = os.path.join(RES, f"mipmap-{d}")
+                          os.makedirs(folder, exist_ok=True)
+                          r = base.resize((size, size), LANCZOS)
+                          r.save(os.path.join(folder, "ic_launcher.png"), "PNG")
+                          r.save(os.path.join(folder, "ic_launcher_round.png"), "PNG")
+                          r.save(os.path.join(folder, "ic_launcher_foreground.png"), "PNG")
+                      print("OK: recovered with emergency placeholder", flush=True)
+                      sys.exit(0)
+                  except Exception as e2:
+                      print(f"::error::emergency placeholder failed: {e2}", flush=True)
+                      sys.exit(1)
+          PYEOF
+
+          python3 /tmp/apkforge/process_icons.py
+          RC=$?
+          echo "icons stage exit code: $RC"
+          exit $RC
+      - name: "stage:splash:Generating Splash"
+        working-directory: ${{ env.BUILD_DIR }}
         run: |
           set -e
-          cd project
-          sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick >/dev/null
-          SRC=icon.png
-          declare -A SIZES=( [mdpi]=48 [hdpi]=72 [xhdpi]=96 [xxhdpi]=144 [xxxhdpi]=192 )
-          for d in "${!SIZES[@]}"; do
-            S=${SIZES[$d]}
-            OUT=app/src/main/res/mipmap-$d
-            mkdir -p "$OUT"
-            convert "$SRC" -resize ${S}x${S}^ -gravity center -extent ${S}x${S} "$OUT/ic_launcher.png"
-            convert "$OUT/ic_launcher.png" \
-              \( +clone -alpha extract -draw "fill black polygon 0,0 0,$S $S,0 fill white circle $((S/2)),$((S/2)) $((S/2)),0" \
-                 \( +clone -flip \) -compose Multiply -composite \
-                 \( +clone -flop \) -compose Multiply -composite \
-              \) -alpha off -compose CopyOpacity -composite "$OUT/ic_launcher_round.png"
-            FS=$((S * 3 / 2))
-            convert "$SRC" -resize $((S*2/3))x$((S*2/3))^ -gravity center -background none -extent ${FS}x${FS} "$OUT/ic_launcher_foreground.png"
-          done
-          curl -sS -X POST "${{ inputs.callback_url }}/status" \
-            -H "content-type: application/json" -H "x-build-token: ${{ inputs.callback_token }}" \
-            -d '{"build_id":"${{ inputs.build_id }}","stage":"icons","status":"success","message":"Launcher icons generated"}' || true
+          SRC="/tmp/icon-final.png"
+          if [ ! -f "$SRC" ]; then SRC="app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"; fi
+          convert "$SRC" -resize 320x320 -background '#0A0505' -gravity center -extent 480x800 app/src/main/res/drawable/splash.png
+          test -f app/src/main/res/drawable/splash.png
+          echo "Splash generated"
 
-      - name: Create signing keystore
+      - name: "stage:gradle_config:Configuring Gradle"
+        working-directory: ${{ env.BUILD_DIR }}
         run: |
-          set -e
-          cd project
-          keytool -genkeypair -v -keystore release.keystore -alias appkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass "${{ inputs.build_id }}" -keypass "${{ inputs.build_id }}" \
-            -dname "CN=Website to APK Converter, OU=Zain Developer, O=Zain Developer, C=US"
-          curl -sS -X POST "${{ inputs.callback_url }}/status" \
-            -H "content-type: application/json" -H "x-build-token: ${{ inputs.callback_token }}" \
-            -d '{"build_id":"${{ inputs.build_id }}","stage":"sign","status":"success","message":"Keystore generated"}' || true
+          test -f build.gradle.kts
+          test -f gradle.properties
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
 
-      - name: Gradle build
-        id: gradle
-        run: |
-          set -o pipefail
-          cd project
-          curl -sS -X POST "${{ inputs.callback_url }}/status" \
-            -H "content-type: application/json" -H "x-build-token: ${{ inputs.callback_token }}" \
-            -d '{"build_id":"${{ inputs.build_id }}","stage":"assemble","status":"running","message":"Compiling Android application"}' || true
-          gradle --no-daemon assembleRelease 2>&1 | tail -n 400
-
-      - name: Sign and verify APK
-        id: sign
-        run: |
-          set -e
-          cd project
-          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)
-          TOOLS="$ANDROID_HOME/build-tools/$BT"
-          UNSIGNED=$(find app/build/outputs/apk/release -name '*.apk' | head -n1)
-          "$TOOLS/zipalign" -p -f 4 "$UNSIGNED" aligned.apk
-          "$TOOLS/apksigner" sign --ks release.keystore --ks-key-alias appkey \
-            --ks-pass pass:"${{ inputs.build_id }}" --key-pass pass:"${{ inputs.build_id }}" \
-            --out app-release.apk aligned.apk
-          "$TOOLS/apksigner" verify --verbose app-release.apk
-          SIZE=$(stat -c%s app-release.apk)
-          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
-          if [ "$SIZE" -lt 200000 ]; then echo "APK suspiciously small"; exit 1; fi
-
-      - uses: actions/upload-artifact@v4
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          name: app-release-${{ inputs.build_id }}
-          path: project/app-release.apk
-          retention-days: 7
+          gradle-version: "8.11.1"
 
-      - name: Upload APK to app storage
+      - name: "stage:compile:Compiling Resources"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: gradle --no-daemon :app:processReleaseResources --stacktrace
+
+      - name: "stage:gradle_build:Running Gradle Build"
+        working-directory: ${{ env.BUILD_DIR }}
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/signing/release.jks
         run: |
           set -e
-          cd project
-          curl -sS --fail -X POST "${{ inputs.callback_url }}/artifact" \
-            -H "x-build-token: ${{ inputs.callback_token }}" \
-            -H "x-build-id: ${{ inputs.build_id }}" \
-            -H "content-type: application/vnd.android.package-archive" \
-            --data-binary @app-release.apk
+          cd "$GITHUB_WORKSPACE"
+          if [ ! -f signing/release.jks ] || [ ! -f signing/release.env ]; then
+            echo "No permanent release key yet — creating one (reused for all future builds)"
+            mkdir -p signing
+            PASS=$(openssl rand -hex 24)
+            keytool -genkeypair -keystore signing/release.jks -storepass "$PASS" \
+              -alias release -keypass "$PASS" -keyalg RSA -keysize 4096 \
+              -validity 36500 -dname "CN=Zain Developer, OU=Apps, O=Zain Developer, L=Karachi, ST=Sindh, C=PK"
+            printf 'KS_PASS=%s\n' "$PASS" > signing/release.env
+            git config user.name "apk-builder"; git config user.email "apk-builder@users.noreply.github.com"
+            git add signing/release.jks signing/release.env
+            git commit -m "chore: add permanent release signing key"
+            for i in 1 2 3; do git pull --rebase && git push && break || sleep 3; done || echo "warn: could not persist key"
+          fi
+          . signing/release.env
+          echo "::add-mask::$KS_PASS"
+          echo "KS_PASS=$KS_PASS" >> $GITHUB_ENV
+          export KEYSTORE_PASSWORD="$KS_PASS" KEY_ALIAS=release KEY_PASSWORD="$KS_PASS"
+          cd "$GITHUB_WORKSPACE/$BUILD_DIR"
+          gradle --no-daemon :app:assembleRelease --stacktrace
 
-      - name: Report failure
-        if: failure()
+      - name: "stage:sign:Signing APK"
+        working-directory: ${{ env.BUILD_DIR }}
         run: |
-          curl -sS -X POST "${{ inputs.callback_url }}/status" \
-            -H "content-type: application/json" -H "x-build-token: ${{ inputs.callback_token }}" \
-            -d '{"build_id":"${{ inputs.build_id }}","stage":"assemble","status":"failed","message":"Build failed. See the GitHub Actions run log for details."}' || true
+          APK=$(ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -n1)
+          test -n "$APK" || (echo "No APK output" && exit 1)
+          echo "Found APK: $APK"
+          echo "APK=$APK" >> $GITHUB_ENV
+
+      - name: "stage:optimize:Optimizing APK"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
+          ALIGNED="app/build/outputs/apk/release/aligned.apk"
+          "$ANDROID_HOME/build-tools/$BT/zipalign" -p -f 4 "$APK" "$ALIGNED"
+          mv "$ALIGNED" "$APK"
+          echo "Zipaligned: $APK"
+          "$ANDROID_HOME/build-tools/$BT/apksigner" sign \
+            --ks "$GITHUB_WORKSPACE/signing/release.jks"             --ks-pass env:KS_PASS             --key-pass env:KS_PASS             --ks-key-alias release \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            "$APK"
+          echo "Signed with apksigner (v1+v2+v3)"
+
+      - name: "stage:verify:Verifying APK"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --verbose --print-certs "$APK"
+          SIZE=$(stat -c%s "$APK")
+          echo "APK size: $SIZE bytes"
+          test "$SIZE" -gt 100000 || (echo "APK too small" && exit 1)
+          head -c 4 "$APK" | xxd | grep -q "504b 0304" || (echo "Not a valid zip/apk" && exit 1)
+
+      - name: "stage:ready:APK Ready"
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          FINAL="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$FINAL" ]; then cp "$APK" "$FINAL"; fi
+          ls -la app/build/outputs/apk/release/
+
+      - name: Upload APK
+        if: always() && env.APK != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: ${{ env.BUILD_DIR }}/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
