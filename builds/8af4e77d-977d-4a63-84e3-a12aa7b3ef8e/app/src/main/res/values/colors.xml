@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="offlineBg">#FAFAFA</color>
+    <color name="splashBg">#0A0505</color>
+    <color name="splashText">#FFFFFF</color>
+    <color name="accent">#E11D2E</color>
+</resources>
