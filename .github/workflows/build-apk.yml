@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
-      contents: read
+      contents: write
       actions: read
 
     env:
@@ -355,14 +355,28 @@ jobs:
       - name: "stage:gradle_build:Running Gradle Build"
         working-directory: ${{ env.BUILD_DIR }}
         env:
-          KEYSTORE_PATH: ${{ github.workspace }}/${{ env.BUILD_DIR }}/debug.keystore
-          KEYSTORE_PASSWORD: android
-          KEY_ALIAS: androiddebugkey
-          KEY_PASSWORD: android
+          KEYSTORE_PATH: ${{ github.workspace }}/signing/release.jks
         run: |
-          keytool -genkey -v -keystore debug.keystore -storepass android \
-            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
-            -validity 10000 -dname "CN=APK Forge, OU=Zain, O=Zain Developer, L=NA, ST=NA, C=US"
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          if [ ! -f signing/release.jks ] || [ ! -f signing/release.env ]; then
+            echo "No permanent release key yet — creating one (reused for all future builds)"
+            mkdir -p signing
+            PASS=$(openssl rand -hex 24)
+            keytool -genkeypair -keystore signing/release.jks -storepass "$PASS" \
+              -alias release -keypass "$PASS" -keyalg RSA -keysize 4096 \
+              -validity 36500 -dname "CN=Zain Developer, OU=Apps, O=Zain Developer, L=Karachi, ST=Sindh, C=PK"
+            printf 'KS_PASS=%s\n' "$PASS" > signing/release.env
+            git config user.name "apk-builder"; git config user.email "apk-builder@users.noreply.github.com"
+            git add signing/release.jks signing/release.env
+            git commit -m "chore: add permanent release signing key"
+            for i in 1 2 3; do git pull --rebase && git push && break || sleep 3; done || echo "warn: could not persist key"
+          fi
+          . signing/release.env
+          echo "::add-mask::$KS_PASS"
+          echo "KS_PASS=$KS_PASS" >> $GITHUB_ENV
+          export KEYSTORE_PASSWORD="$KS_PASS" KEY_ALIAS=release KEY_PASSWORD="$KS_PASS"
+          cd "$GITHUB_WORKSPACE/$BUILD_DIR"
           gradle --no-daemon :app:assembleRelease --stacktrace
 
       - name: "stage:sign:Signing APK"
@@ -382,10 +396,7 @@ jobs:
           mv "$ALIGNED" "$APK"
           echo "Zipaligned: $APK"
           "$ANDROID_HOME/build-tools/$BT/apksigner" sign \
-            --ks debug.keystore \
-            --ks-pass pass:android \
-            --key-pass pass:android \
-            --ks-key-alias androiddebugkey \
+            --ks "$GITHUB_WORKSPACE/signing/release.jks"             --ks-pass env:KS_PASS             --key-pass env:KS_PASS             --ks-key-alias release \
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
