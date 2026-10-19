@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Clipper Star Salon</string>
+    <string name="offline_title">You are offline</string>
+    <string name="offline_message">Check your internet connection and try again.</string>
+    <string name="offline_retry">Retry</string>
+    <string name="download_started">Download started</string>
+    <string name="download_failed">Download failed</string>
+    <string name="no_app_found">No app found to open this link</string>
+</resources>
