@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/splashBg">
+
+    <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+        android:id="@+id/refresh"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+        <WebView android:id="@+id/webview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"/>
+    </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+
+    <LinearLayout android:id="@+id/offline"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="24dp"
+        android:visibility="gone"
+        android:background="@color/offlineBg">
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="You're offline"
+            android:textSize="20sp" android:textStyle="bold"/>
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Check your connection and try again."
+            android:layout_marginTop="8dp"/>
+        <Button android:id="@+id/retry"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Retry"/>
+    </LinearLayout>
+
+    <FrameLayout android:id="@+id/splashLayer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@drawable/splash_bg"
+        android:clickable="true"
+        android:focusable="true">
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:orientation="vertical"
+            android:gravity="center">
+            <FrameLayout
+                android:layout_width="200dp"
+                android:layout_height="200dp">
+                <View android:id="@+id/splashRing1"
+                    android:layout_width="120dp" android:layout_height="120dp"
+                    android:layout_gravity="center"
+                    android:background="@drawable/splash_ring"/>
+                <View android:id="@+id/splashRing2"
+                    android:layout_width="120dp" android:layout_height="120dp"
+                    android:layout_gravity="center"
+                    android:background="@drawable/splash_ring"/>
+                <View android:id="@+id/splashOrbit"
+                    android:layout_width="132dp" android:layout_height="132dp"
+                    android:layout_gravity="center"
+                    android:background="@drawable/splash_orbit"/>
+                <ImageView android:id="@+id/splashLogo"
+                    android:layout_width="100dp"
+                    android:layout_height="100dp"
+                    android:layout_gravity="center"
+                    android:src="@drawable/splash"
+                    android:scaleType="centerCrop"
+                    android:elevation="8dp"
+                    android:contentDescription="@string/app_name"/>
+            </FrameLayout>
+            <TextView android:id="@+id/splashTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/app_name"
+                android:textColor="@color/splashText"
+                android:textSize="26sp"
+                android:letterSpacing="0.04"
+                android:shadowColor="@color/accent"
+                android:shadowRadius="18"
+                android:textStyle="bold"/>
+            <TextView android:id="@+id/splashTagline"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Loading your experience…"
+                android:textColor="@color/splashText"
+                android:textSize="13sp"/>
+            <FrameLayout android:id="@+id/splashProgress"
+                android:layout_width="160dp"
+                android:layout_height="4dp"
+                android:layout_marginTop="28dp"
+                android:background="@drawable/splash_track">
+                <View android:id="@+id/splashFill"
+                    android:layout_width="60dp"
+                    android:layout_height="match_parent"
+                    android:background="@drawable/splash_fill"/>
+            </FrameLayout>
+        </LinearLayout>
+    </FrameLayout>
+</FrameLayout>
